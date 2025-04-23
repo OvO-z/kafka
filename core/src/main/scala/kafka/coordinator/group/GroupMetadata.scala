@@ -243,34 +243,44 @@ private[group] class GroupMetadata(val groupId: String, initialState: GroupState
       staticMembers.put(instanceId, member.memberId)
     }
 
-    if (members.isEmpty)
+    // 如果是要添加的第一个消费者组成员
+    if (members.isEmpty) {
+      // 就把该成员的procotolType设置为消费者组的protocolType
       this.protocolType = Some(member.protocolType)
-
+    }
+    // 确保成员元数据中的protoclType和组protocolType相同
     assert(this.protocolType.orNull == member.protocolType)
+    /// 确保该成员选定的分区分配策略与组选定的分区分配策略相匹配
     assert(supportsProtocols(member.protocolType, MemberMetadata.plainProtocolSet(member.supportedProtocols)))
-
+    // 如果尚未选出Leader成员
     if (leaderId.isEmpty)
+      // 把该成员设定为Leader成员
       leaderId = Some(member.memberId)
 
     members.put(member.memberId, member)
+    // 更新分区分配策略支持票数
     incSupportedProtocols(member)
+    // 设置成员加入组后的回调逻辑
     member.awaitingJoinCallback = callback
 
     if (member.isAwaitingJoin)
+      // 更新已加入组的成员数
       numMembersAwaitingJoin += 1
 
     pendingMembers.remove(member.memberId)
   }
 
   def remove(memberId: String): Unit = {
+    // 从members中移除给定成员
     members.remove(memberId).foreach { member =>
+      // 更新分区分配策略支持票数
       decSupportedProtocols(member)
       if (member.isAwaitingJoin)
         numMembersAwaitingJoin -= 1
 
       member.groupInstanceId.foreach(staticMembers.remove)
     }
-
+    // 如果该成员是Leader，选择剩下成员列表中的第一个作为新的Leader成员
     if (isLeader(memberId))
       leaderId = members.keys.headOption
 

@@ -84,7 +84,7 @@ class ControllerEventManager(controllerId: Int,
   // Visible for test
   private[controller] var thread = new ControllerEventThread(ControllerEventThreadName)
 
-  private val eventQueueTimeHist = metricsGroup.newHistogram(EventQueueTimeMetricName)
+  private val eventQueueTimeHist = metricsGroup.newHistogram(EventQueueTimeMetricName)F
 
   metricsGroup.newGauge(EventQueueSizeMetricName, () => queue.size)
 
@@ -118,36 +118,36 @@ class ControllerEventManager(controllerId: Int,
 
   def isEmpty: Boolean = queue.isEmpty
 
-  class ControllerEventThread(name: String)
+  class ControllerEventThread(name: String)override def doWork(): Unit = {
+    val dequeued = pollFromEventQueue()
+    dequeued.event match {
+      case ShutdownEventThread => // The shutting down of the thread has been initiated at this point. Ignore this event.
+      case controllerEvent =>
+        _state = controllerEvent.state
+
+        eventQueueTimeHist.update(time.milliseconds() - dequeued.enqueueTimeMs)
+
+        try {
+          def process(): Unit = dequeued.process(processor)
+
+          rateAndTimeMetrics.get(state) match {
+            case Some(timer) => timer.time(() => process())
+            case None => process()
+          }
+        } catch {
+          case e: Throwable => error(s"Uncaught error processing event $controllerEvent", e)
+        }
+
+        _state = ControllerState.Idle
+    }
+  }
     extends ShutdownableThread(
       name, false, s"[ControllerEventThread controllerId=$controllerId] ")
       with Logging {
 
     logIdent = logPrefix
 
-    override def doWork(): Unit = {
-      val dequeued = pollFromEventQueue()
-      dequeued.event match {
-        case ShutdownEventThread => // The shutting down of the thread has been initiated at this point. Ignore this event.
-        case controllerEvent =>
-          _state = controllerEvent.state
 
-          eventQueueTimeHist.update(time.milliseconds() - dequeued.enqueueTimeMs)
-
-          try {
-            def process(): Unit = dequeued.process(processor)
-
-            rateAndTimeMetrics.get(state) match {
-              case Some(timer) => timer.time(() => process())
-              case None => process()
-            }
-          } catch {
-            case e: Throwable => error(s"Uncaught error processing event $controllerEvent", e)
-          }
-
-          _state = ControllerState.Idle
-      }
-    }
   }
 
   private def pollFromEventQueue(): QueuedEvent = {

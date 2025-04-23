@@ -774,6 +774,7 @@ class ReplicaManager(val config: KafkaConfig,
                     requestLocal: RequestLocal = RequestLocal.NoCaching,
                     transactionalId: String = null,
                     actionQueue: ActionQueue = this.defaultActionQueue): Unit = {
+    // requiredAcks合法取值是-1，0，1，否则视为非法
     if (isValidRequiredAcks(requiredAcks)) {
 
       val verificationGuards: mutable.Map[TopicPartition, VerificationGuard] = mutable.Map[TopicPartition, VerificationGuard]()
@@ -817,7 +818,7 @@ class ReplicaManager(val config: KafkaConfig,
             requestLocal)
         ))
       }
-    } else {
+    } else { // 如果requiredAcks值不合法
       // If required.acks is outside accepted range, something is wrong with the client
       // Just return an error and don't handle the request at all
       val responseStatus = entriesPerPartition.map { case (topicPartition, _) =>
@@ -828,6 +829,7 @@ class ReplicaManager(val config: KafkaConfig,
           LogAppendInfo.UNKNOWN_LOG_APPEND_INFO.logStartOffset
         )
       }
+      // 构造INVALID_REQUIRED_ACKS异常并封装进回调函数调用中
       responseCallback(responseStatus)
     }
   }
@@ -2149,18 +2151,25 @@ class ReplicaManager(val config: KafkaConfig,
           }
 
           val highWatermarkCheckpoints = new LazyOffsetCheckpoints(this.highWatermarkCheckpoints)
-          val partitionsBecomeLeader = if (partitionsToBeLeader.nonEmpty)
+          val partitionsBecomeLeader = if (partitionsToBeLeader.nonEmpty) {
+            // 调用makeLeaders方法为partitionsToBeLeader所有分区, 执行"成为Leader副本"的逻辑
+            // 如果有分区的本地日志为空，说明底层的日志路径不可用, 标记该分区为Offline状态
             makeLeaders(controllerId, controllerEpoch, partitionsToBeLeader, correlationId, responseMap,
               highWatermarkCheckpoints, topicIdFromRequest)
-          else
+          } else
             Set.empty[Partition]
           val partitionsBecomeFollower = if (partitionsToBeFollower.nonEmpty)
+            // 调用makeFollowers方法为令partitionsToBeFollower所有分区
+            // 执行"成为Follower副本"的逻辑
             makeFollowers(controllerId, controllerEpoch, partitionsToBeFollower, correlationId, responseMap,
               highWatermarkCheckpoints, topicIdFromRequest)
           else
             Set.empty[Partition]
-
+          // 对于当前Broker成为Follower副本的主题,
+          // 移除它们之前的Leader副本监控指标
           val followerTopicSet = partitionsBecomeFollower.map(_.topic).toSet
+
+
           updateLeaderAndFollowerMetrics(followerTopicSet)
 
           if (topicIdUpdateFollowerPartitions.nonEmpty)
@@ -2168,18 +2177,23 @@ class ReplicaManager(val config: KafkaConfig,
 
           // We initialize highwatermark thread after the first LeaderAndIsr request. This ensures that all the partitions
           // have been completely populated before starting the checkpointing there by avoiding weird race conditions
+          // 启动高水位检查点专属线程
+          // 定期将Broker上所有非Offline分区的高水位值写入到检查点文件
           startHighWatermarkCheckPointThread()
-
+          // 添加日志路径数据迁移线程
           maybeAddLogDirFetchers(partitions, highWatermarkCheckpoints, topicIdFromRequest)
-
+          // 关闭空闲副本拉取线程
           replicaFetcherManager.shutdownIdleFetcherThreads()
+          // 关闭空闲日志路径数据迁移线程
           replicaAlterLogDirsManager.shutdownIdleFetcherThreads()
 
           remoteLogManager.foreach(rlm => rlm.onLeadershipChange(partitionsBecomeLeader.asJava, partitionsBecomeFollower.asJava, topicIds))
 
+          // 执行Leader变更之后的回调逻辑
           onLeadershipChange(partitionsBecomeLeader, partitionsBecomeFollower)
 
           val data = new LeaderAndIsrResponseData().setErrorCode(Errors.NONE.code)
+          // 构造LeaderAndIsrRequest请求的Response并返回
           if (leaderAndIsrRequest.version < 5) {
             responseMap.forKeyValue { (tp, error) =>
               data.partitionErrors.add(new LeaderAndIsrPartitionError()

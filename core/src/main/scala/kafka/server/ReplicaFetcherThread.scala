@@ -104,12 +104,15 @@ class ReplicaFetcherThread(name: String,
                                     fetchOffset: Long,
                                     partitionData: FetchData): Option[LogAppendInfo] = {
     val logTrace = isTraceEnabled
+    // 从副本管理器获取指定主题分区对象
     val partition = replicaMgr.getPartitionOrException(topicPartition)
+    // 获取日志对象
     val log = partition.localLogOrException
+    // 将获取到的数据转换成符合格式要求的消息集合
     val records = toMemoryRecords(FetchResponse.recordsOrFail(partitionData))
 
     maybeWarnIfOversizedRecords(records, topicPartition)
-
+    // 要读取的起始位移值如果不是本地日志LEO值则视为异常情况
     if (fetchOffset != log.logEndOffset)
       throw new IllegalStateException("Offset mismatch for partition %s: fetched offset = %d, log end offset = %d.".format(
         topicPartition, fetchOffset, log.logEndOffset))
@@ -119,6 +122,7 @@ class ReplicaFetcherThread(name: String,
         .format(log.logEndOffset, topicPartition, records.sizeInBytes, partitionData.highWatermark))
 
     // Append the leader's messages to the log
+    // 写入Follower副本本地日志
     val logAppendInfo = partition.appendRecordsToFollowerOrFutureReplica(records, isFuture = false)
 
     if (logTrace)
@@ -129,11 +133,12 @@ class ReplicaFetcherThread(name: String,
     // For the follower replica, we do not need to keep its segment base offset and physical position.
     // These values will be computed upon becoming leader or handling a preferred read replica fetch.
     var maybeUpdateHighWatermarkMessage = s"but did not update replica high watermark"
+    // 更新Follower副本的高水位值
     log.maybeUpdateHighWatermark(partitionData.highWatermark).foreach { newHighWatermark =>
       maybeUpdateHighWatermarkMessage = s"and updated replica high watermark to $newHighWatermark"
       partitionsWithNewHighWatermark += topicPartition
     }
-
+    // 尝试更新Follower副本的Log Start Offset值
     log.maybeIncrementLogStartOffset(leaderLogStartOffset, LogStartOffsetIncrementReason.LeaderOffsetIncremented)
     if (logTrace)
       trace(s"Follower received high watermark ${partitionData.highWatermark} from the leader " +
@@ -141,6 +146,7 @@ class ReplicaFetcherThread(name: String,
 
     // Traffic from both in-sync and out of sync replicas are accounted for in replication quota to ensure total replication
     // traffic doesn't exceed quota.
+    // 副本消息拉取限流
     if (quota.isThrottled(topicPartition))
       quota.record(records.sizeInBytes)
 
@@ -148,7 +154,7 @@ class ReplicaFetcherThread(name: String,
       brokerTopicStats.updateReassignmentBytesIn(records.sizeInBytes)
 
     brokerTopicStats.updateReplicationBytesIn(records.sizeInBytes)
-
+    // 返回日志写入结果
     logAppendInfo
   }
 
@@ -173,9 +179,12 @@ class ReplicaFetcherThread(name: String,
    * The logic for finding the truncation offset is implemented in AbstractFetcherThread.getOffsetTruncationState
    */
   override def truncate(tp: TopicPartition, offsetTruncationState: OffsetTruncationState): Unit = {
+    //// 拿到分区对象
     val partition = replicaMgr.getPartitionOrException(tp)
+    //拿到分区本地日志
     val log = partition.localLogOrException
 
+    // 执行截断操作，截断到的位置由offsetTruncationState的offset指定
     partition.truncateTo(offsetTruncationState.offset, isFuture = false)
 
     if (offsetTruncationState.offset < log.highWatermark)

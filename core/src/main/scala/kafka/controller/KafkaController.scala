@@ -571,36 +571,30 @@ class KafkaController(val config: KafkaConfig,
    */
   private def onBrokerStartup(newBrokers: Seq[Int]): Unit = {
     info(s"New broker startup callback for ${newBrokers.mkString(",")}")
+    // 1. 移除元数据中新增的Broker对应副本集合
     newBrokers.foreach(controllerContext.replicasOnOfflineDirs.remove)
     val newBrokersSet = newBrokers.toSet
     val existingBrokers = controllerContext.liveOrShuttingDownBrokerIds.diff(newBrokersSet)
-    // Send update metadata request to all the existing brokers in the cluster so that they know about the new brokers
-    // via this update. No need to include any partition states in the request since there are no partition state changes.
+    // 2. 给集群现有Broker发送元数据更新请求，令它们感知到新增Broker的到来
     sendUpdateMetadataRequest(existingBrokers.toSeq, Set.empty)
-    // Send update metadata request to all the new brokers in the cluster with a full set of partition states for initialization.
-    // In cases of controlled shutdown leaders will not be elected when a new broker comes up. So at least in the
-    // common controlled shutdown case, the metadata will reach the new brokers faster.
+    // 3.给新增Broker发送元数据更新请求，令它们同步集群当前的所有分区数据
     sendUpdateMetadataRequest(newBrokers, controllerContext.partitionsWithLeaders)
-    // the very first thing to do when a new broker comes up is send it the entire list of partitions that it is
-    // supposed to host. Based on that the broker starts the high watermark threads for the input list of partitions
+    // 4.将新增Broker上的所有副本设置为Online状态，即可用状态
     val allReplicasOnNewBrokers = controllerContext.replicasOnBrokers(newBrokersSet)
-    replicaStateMachine.handleStateChanges(allReplicasOnNewBrokers.toSeq, OnlineReplica)
-    // when a new broker comes up, the controller needs to trigger leader election for all new and offline partitions
-    // to see if these brokers can become leaders for some/all of those
     partitionStateMachine.triggerOnlinePartitionStateChange()
-    // check if reassignment of some partitions need to be restarted
+    // 5.重启之前暂停的副本迁移操作
     maybeResumeReassignments { (_, assignment) =>
       assignment.targetReplicas.exists(newBrokersSet.contains)
     }
-    // check if topic deletion needs to be resumed. If at least one replica that belongs to the topic being deleted exists
-    // on the newly restarted brokers, there is a chance that topic deletion can resume
     val replicasForTopicsToBeDeleted = allReplicasOnNewBrokers.filter(p => topicDeletionManager.isTopicQueuedUpForDeletion(p.topic))
+    // 6.重启之前暂停的主题删除操作
     if (replicasForTopicsToBeDeleted.nonEmpty) {
       info(s"Some replicas ${replicasForTopicsToBeDeleted.mkString(",")} for topics scheduled for deletion " +
         s"${controllerContext.topicsToBeDeleted.mkString(",")} are on the newly restarted brokers " +
         s"${newBrokers.mkString(",")}. Signaling restart of topic deletion for these topics")
       topicDeletionManager.resumeDeletionForTopics(replicasForTopicsToBeDeleted.map(_.topic))
     }
+    // 7.为新增Broker注册BrokerModificationsHandler监听器
     registerBrokerModificationsHandler(newBrokers)
   }
 
@@ -634,14 +628,19 @@ class KafkaController(val config: KafkaConfig,
    */
   private def onBrokerFailure(deadBrokers: Seq[Int]): Unit = {
     info(s"Broker failure callback for ${deadBrokers.mkString(",")}")
+    // 1.为每个待移除Broker，删除元数据对象中的相关项
     deadBrokers.foreach(controllerContext.replicasOnOfflineDirs.remove)
+    // 2.将待移除Broker从元数据对象中处于已关闭状态的Broker列表中去除
     val deadBrokersThatWereShuttingDown =
       deadBrokers.filter(id => controllerContext.shuttingDownBrokerIds.remove(id))
-    if (deadBrokersThatWereShuttingDown.nonEmpty)
+    if (deadBrokersThatWereShuttingDown.nonEmpty) {
       info(s"Removed ${deadBrokersThatWereShuttingDown.mkString(",")} from list of shutting down brokers.")
+    }
+    // 3.找出待移除Broker上的所有副本对象，执行相应操作，
+    // 将其置为“不可用状态”（即Offline）
     val allReplicasOnDeadBrokers = controllerContext.replicasOnBrokers(deadBrokers.toSet)
     onReplicasBecomeOffline(allReplicasOnDeadBrokers)
-
+    // 4.注销注册的BrokerModificationsHandler监听器
     unregisterBrokerModificationsHandler(deadBrokers)
   }
 
@@ -1608,11 +1607,15 @@ class KafkaController(val config: KafkaConfig,
   }
 
   private def processBrokerChange(): Unit = {
-    if (!isActive) return
+    // 如果该Broker不是Controller，返回
+    if (!isActive) return;
+    // 1. 从Zookeeper中获取集群Broker列表
     val curBrokerAndEpochs = zkClient.getAllBrokerAndEpochsInCluster
     val curBrokerIdAndEpochs = curBrokerAndEpochs map { case (broker, epoch) => (broker.id, epoch) }
     val curBrokerIds = curBrokerIdAndEpochs.keySet
+    // 2. 获取当前Controller保存的Broker列表
     val liveOrShuttingDownBrokerIds = controllerContext.liveOrShuttingDownBrokerIds
+    // 3.比较两个列表、获取新增Broker列表，待移除Broker列表
     val newBrokerIds = curBrokerIds.diff(liveOrShuttingDownBrokerIds)
     val deadBrokerIds = liveOrShuttingDownBrokerIds.diff(curBrokerIds)
     val bouncedBrokerIds = (curBrokerIds & liveOrShuttingDownBrokerIds)
@@ -1627,12 +1630,14 @@ class KafkaController(val config: KafkaConfig,
       s"deleted brokers: ${deadBrokerIdsSorted.mkString(",")}, " +
       s"bounced brokers: ${bouncedBrokerIdsSorted.mkString(",")}, " +
       s"all live brokers: ${liveBrokerIdsSorted.mkString(",")}")
-
+    // 4.为新增的Broker创建通道管理其和请求发送线程
     newBrokerAndEpochs.keySet.foreach(controllerChannelManager.addBroker)
+    // 5.为每个已重启的Broker移除现有配套资源并出现添加
     bouncedBrokerIds.foreach(controllerChannelManager.removeBroker)
     bouncedBrokerAndEpochs.keySet.foreach(controllerChannelManager.addBroker)
+    // 6.为待移除Broker移除对应的配套资源
     deadBrokerIds.foreach(controllerChannelManager.removeBroker)
-
+    // 7.为新增Broker执行更新Controller元数据和Broker启动逻辑
     if (newBrokerIds.nonEmpty) {
       val (newCompatibleBrokerAndEpochs, newIncompatibleBrokerAndEpochs) =
         partitionOnFeatureCompatibility(newBrokerAndEpochs)
@@ -1643,6 +1648,7 @@ class KafkaController(val config: KafkaConfig,
       controllerContext.addLiveBrokers(newCompatibleBrokerAndEpochs)
       onBrokerStartup(newBrokerIdsSorted)
     }
+    // 8.为为已重启Broker执行重添加逻辑,执行更新Controller元数据和Broker启动逻辑
     if (bouncedBrokerIds.nonEmpty) {
       controllerContext.removeLiveBrokers(bouncedBrokerIds)
       onBrokerFailure(bouncedBrokerIdsSorted)
@@ -1655,6 +1661,7 @@ class KafkaController(val config: KafkaConfig,
       controllerContext.addLiveBrokers(bouncedCompatibleBrokerAndEpochs)
       onBrokerStartup(bouncedBrokerIdsSorted)
     }
+    // 9.为待移除Broker执行移除ControllerContext和Broker终止逻辑
     if (deadBrokerIds.nonEmpty) {
       controllerContext.removeLiveBrokers(deadBrokerIds)
       onBrokerFailure(deadBrokerIdsSorted)
@@ -1682,16 +1689,23 @@ class KafkaController(val config: KafkaConfig,
 
   private def processTopicChange(): Unit = {
     if (!isActive) return
+    // 1. 从ZooKeeper中获取所有主题
     val topics = zkClient.getAllTopicsInCluster(true)
+    // 2.与元数据缓存比对，找出新增主题列表与已删除主题列表
     val newTopics = topics -- controllerContext.allTopics
     val deletedTopics = controllerContext.allTopics.diff(topics)
+    // 3. 使用ZooKeeper中的主题列表更新元数据缓存
     controllerContext.setAllTopics(topics)
 
+    // 4.为新增主题注册分区变更监听器
+    // 分区变更监听器是监听主题分区变更的
     registerPartitionModificationsHandlers(newTopics.toSeq)
+    // 5. 从ZooKeeper中获取新增主题的副本分配情况
     val addedPartitionReplicaAssignment = zkClient.getReplicaAssignmentAndTopicIdForTopics(newTopics)
+    // 6.清除元数据缓存中属于已删除主题的缓存项
     deletedTopics.foreach(controllerContext.removeTopic)
     processTopicIds(addedPartitionReplicaAssignment)
-
+    // 7.为新增主题更新元数据缓存中的副本分配条目
     addedPartitionReplicaAssignment.foreach { case TopicIdReplicaAssignment(_, _, newAssignments) =>
       newAssignments.foreach { case (topicAndPartition, newReplicaAssignment) =>
         controllerContext.updatePartitionFullReplicaAssignment(topicAndPartition, newReplicaAssignment)
@@ -1699,6 +1713,7 @@ class KafkaController(val config: KafkaConfig,
     }
     info(s"New topics: [$newTopics], deleted topics: [$deletedTopics], new partition replica assignment " +
       s"[$addedPartitionReplicaAssignment]")
+    // 8. 调整新增主题所有分区以及所属所有副本的运行状态为“上线”状态
     if (addedPartitionReplicaAssignment.nonEmpty) {
       val partitionAssignments = addedPartitionReplicaAssignment
         .map { case TopicIdReplicaAssignment(_, _, partitionsReplicas) => partitionsReplicas.keySet }
@@ -1786,14 +1801,17 @@ class KafkaController(val config: KafkaConfig,
 
   private def processTopicDeletion(): Unit = {
     if (!isActive) return
+    // 从ZooKeeper中获取待删除主题列表
     var topicsToBeDeleted = zkClient.getTopicDeletions.toSet
     debug(s"Delete topics listener fired for topics ${topicsToBeDeleted.mkString(",")} to be deleted")
+    // 找出不存在的主题列表
     val nonExistentTopics = topicsToBeDeleted -- controllerContext.allTopics
     if (nonExistentTopics.nonEmpty) {
       warn(s"Ignoring request to delete non-existing topics ${nonExistentTopics.mkString(",")}")
       zkClient.deleteTopicDeletions(nonExistentTopics.toSeq, controllerContext.epochZkVersion)
     }
     topicsToBeDeleted --= nonExistentTopics
+    // 如果delete.topic.enable参数设置成true
     if (config.deleteTopicEnable) {
       if (topicsToBeDeleted.nonEmpty) {
         info(s"Starting topic deletion for topics ${topicsToBeDeleted.mkString(",")}")
@@ -1806,11 +1824,13 @@ class KafkaController(val config: KafkaConfig,
               reason = "topic reassignment in progress")
         }
         // add topic to deletion list
+        // 将待删除主题插入到删除等待集合交由TopicDeletionManager处理
         topicDeletionManager.enqueueTopicsForDeletion(topicsToBeDeleted)
       }
-    } else {
+    } else { // 不允许删除主题
       // If delete topic is disabled remove entries under zookeeper path : /admin/delete_topics
       info(s"Removing $topicsToBeDeleted since delete topic is disabled")
+      // 清除ZooKeeper下/admin/delete_topics下的子节点
       zkClient.deleteTopicDeletions(topicsToBeDeleted.toSeq, controllerContext.epochZkVersion)
     }
   }
@@ -2645,10 +2665,10 @@ class KafkaController(val config: KafkaConfig,
         case UpdateFeatures(request, callback) =>
           processFeatureUpdates(request, callback)
         case PartitionReassignmentIsrChange(partition) =>
-          processPartitionReassignmentIsrChange(partition)
+          processPartitionReassignmentIsrChange(partition)```
         case IsrChangeNotification =>
           processIsrChangeNotification()
-        case AlterPartitionReceived(alterPartitionRequest, alterPartitionRequestVersion, callback) =>
+        case AlterPartitionReceived(alterPartitionRequest, alterPartitionRequestVersion,``` callback) =>
           processAlterPartition(alterPartitionRequest, alterPartitionRequestVersion, callback)
         case AllocateProducerIds(brokerId, brokerEpoch, callback) =>
           processAllocateProducerIds(brokerId, brokerEpoch, callback)
